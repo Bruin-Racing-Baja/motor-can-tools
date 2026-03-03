@@ -225,7 +225,11 @@ def main():
         ])
 
         while True:
-            msg = bus.recv(timeout=0.01)
+
+            try:
+                msg = bus.recv(timeout=0.01)
+            except ValueError:
+               continue
             if msg:
                 parse_odrive_message(msg)
 
