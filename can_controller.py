@@ -3,254 +3,299 @@ import struct
 import time
 import csv
 import threading
-import sys
 import os
 
-NODE_IDS = [0x01, 0x03]
-COM_PORT = "COM15"
-BITRATE = 250000
 
-PRINT_CAN = False
+class ODriveCAN:
 
-CONSTANT_POSITION = "position"
-CONSTANT_VELOCITY = "velocity"
-CONSTANT_TORQUE   = "torque"
+    NODE_IDS = [0x01, 0x03]
+    COM_PORT = "COM15"
+    BITRATE = 250000
 
-CONTROL_MODE = CONSTANT_VELOCITY
+    CSV_PREFIX = "odrive_log_"
+    CSV_DIR = "csvs"
 
-DEFAULT_VEL_LIMIT = 100.0
-DEFAULT_CURRENT_SOFT_MAX = 20.0
+    DEFAULT_VEL_LIMIT = 100.0
+    DEFAULT_CURRENT_SOFT_MAX = 20.0
 
-CSV_PREFIX = "odrive_log_"
-CSV_DIR = "csvs"
+    CAN_GET_ENCODER_ESTIMATES = 0x09
+    CAN_GET_IQ = 0x14
+    CAN_GET_BUS_VOLTAGE_CURRENT = 0x17
+    CAN_GET_ERRORS = 0x03
 
-os.makedirs(CSV_DIR, exist_ok=True)
+    CAN_SET_AXIS_STATE = 0x07
+    CAN_SET_CONTROLLER_MODES = 0x0B
+    CAN_SET_INPUT_POS = 0x0C
+    CAN_SET_INPUT_VEL = 0x0D
+    CAN_SET_INPUT_TORQUE = 0x0E
+    CAN_SET_LIMITS = 0x0F
 
-CAN_GET_ENCODER_ESTIMATES     = 0x09
-CAN_GET_IQ                   = 0x14
-CAN_GET_BUS_VOLTAGE_CURRENT  = 0x17
-CAN_GET_ERRORS               = 0x03
+    AXIS_STATE_IDLE = 1
+    AXIS_STATE_CLOSED_LOOP_CONTROL = 8
 
-CAN_SET_AXIS_STATE           = 0x07
-CAN_SET_CONTROLLER_MODES     = 0x0B
-CAN_SET_INPUT_POS            = 0x0C
-CAN_SET_INPUT_VEL            = 0x0D
-CAN_SET_INPUT_TORQUE         = 0x0E
-CAN_SET_LIMITS               = 0x0F
+    CONTROL_MODE_TORQUE = 1
+    CONTROL_MODE_VELOCITY = 2
+    CONTROL_MODE_POSITION = 3
 
-AXIS_STATE_IDLE = 1
-AXIS_STATE_CLOSED_LOOP_CONTROL = 8
+    INPUT_MODE_PASSTHROUGH = 1
 
-CONTROL_MODE_TORQUE   = 1
-CONTROL_MODE_VELOCITY = 2
-CONTROL_MODE_POSITION = 3
+    def __init__(self):
 
-INPUT_MODE_PASSTHROUGH = 1
+        os.makedirs(self.CSV_DIR, exist_ok=True)
 
-state = {
-    node_id: {
-        "pos": None,
-        "vel": None,
-        "iq": None,
-        "bus_v": None,
-        "bus_i": None,
-        "axis_err": None,
-    }
-    for node_id in NODE_IDS
-}
+        self.bus = can.Bus(interface="slcan", channel=self.COM_PORT, bitrate=self.BITRATE)
 
-setpoints = {
-    node_id: {
-        "pos": None,
-        "vel": None,
-        "iq": None,
-    }
-    for node_id in NODE_IDS
-}
+        self.running = False
 
-current_limits = {
-    node_id: {
-        "vel_limit": DEFAULT_VEL_LIMIT,
-        "current_soft_max": DEFAULT_CURRENT_SOFT_MAX,
-    }
-    for node_id in NODE_IDS
-}
+        # Live telemetry state
+        self.state = {
+            node: {
+                "pos": None,
+                "vel": None,
+                "iq": None,
+                "bus_v": None,
+                "bus_i": None,
+                "axis_err": None
+            }
+            for node in self.NODE_IDS
+        }
 
-def make_arbitration_id(node_id, cmd_id):
-    return (node_id << 5) | cmd_id
+        # Command setpoints
+        self.setpoints = {
+            node: {
+                "pos": None,
+                "vel": None,
+                "iq": None
+            }
+            for node in self.NODE_IDS
+        }
 
-def send_can(bus, node_id, cmd_id, payload=b""):
-    msg = can.Message(
-        arbitration_id=make_arbitration_id(node_id, cmd_id),
-        data=payload.ljust(8, b"\x00"),
-        is_extended_id=False
-    )
-    bus.send(msg)
+    # ------------------------------------------------
+    # CAN UTILITIES
+    # ------------------------------------------------
 
-def set_axis_state(bus, node_id, axis_state):
-    send_can(bus, node_id, CAN_SET_AXIS_STATE, struct.pack("<I", axis_state))
+    def _arb(self, node, cmd):
+        return (node << 5) | cmd
 
-def set_controller_mode(bus, node_id, control_mode, input_mode):
-    send_can(bus, node_id, CAN_SET_CONTROLLER_MODES, struct.pack("<II", control_mode, input_mode))
+    def _send(self, node, cmd, payload=b""):
+        msg = can.Message(
+            arbitration_id=self._arb(node, cmd),
+            data=payload.ljust(8, b"\x00"),
+            is_extended_id=False
+        )
+        self.bus.send(msg)
 
-def set_limits(bus, node_id, vel_limit, current_soft_max):
-    send_can(bus, node_id, CAN_SET_LIMITS, struct.pack("<ff", vel_limit, current_soft_max))
-    current_limits[node_id]["vel_limit"] = vel_limit
-    current_limits[node_id]["current_soft_max"] = current_soft_max
+    # ------------------------------------------------
+    # INITIALIZATION
+    # ------------------------------------------------
 
-def clear_setpoints(node_id):
-    setpoints[node_id]["pos"] = None
-    setpoints[node_id]["vel"] = None
-    setpoints[node_id]["iq"]  = None
+    def start(self):
 
-def send_command(bus, node_id, value):
-    clear_setpoints(node_id)
+        for node in self.NODE_IDS:
 
-    if CONTROL_MODE == CONSTANT_POSITION:
-        setpoints[node_id]["pos"] = value
-        send_can(bus, node_id, CAN_SET_INPUT_POS, struct.pack("<fhh", value, 0, 0))
+            self.set_idle(node)
+            time.sleep(0.05)
 
-    elif CONTROL_MODE == CONSTANT_VELOCITY:
-        setpoints[node_id]["vel"] = value
-        send_can(bus, node_id, CAN_SET_INPUT_VEL, struct.pack("<ff", value, 0.0))
+            self.set_limits(node,
+                            self.DEFAULT_VEL_LIMIT,
+                            self.DEFAULT_CURRENT_SOFT_MAX)
 
-    elif CONTROL_MODE == CONSTANT_TORQUE:
-        setpoints[node_id]["iq"] = value
-        send_can(bus, node_id, CAN_SET_INPUT_TORQUE, struct.pack("<f", value))
+            time.sleep(0.05)
 
-def parse_odrive_message(msg):
-    node_id = (msg.arbitration_id >> 5) & 0x3F
-    if node_id not in state:
-        return
+            self._set_controller_mode(node,
+                                      self.CONTROL_MODE_VELOCITY,
+                                      self.INPUT_MODE_PASSTHROUGH)
 
-    cmd_id = msg.arbitration_id & 0x1F
-    data = msg.data
-    s = state[node_id]
+            time.sleep(0.05)
 
-    if cmd_id == CAN_GET_ENCODER_ESTIMATES:
-        s["pos"], = struct.unpack("<f", data[0:4])
-        s["vel"], = struct.unpack("<f", data[4:8])
+            self._set_axis_state(node,
+                                 self.AXIS_STATE_CLOSED_LOOP_CONTROL)
 
-    elif cmd_id == CAN_GET_IQ:
-        s["iq"], = struct.unpack("<f", data[4:8])
+        self.running = True
 
-    elif cmd_id == CAN_GET_BUS_VOLTAGE_CURRENT:
-        s["bus_v"], = struct.unpack("<f", data[0:4])
-        s["bus_i"], = struct.unpack("<f", data[4:8])
+        threading.Thread(
+            target=self._logging_loop,
+            daemon=True
+        ).start()
 
-    elif cmd_id == CAN_GET_ERRORS:
-        s["axis_err"], = struct.unpack("<I", data[4:8])
+    # ------------------------------------------------
+    # INTERNAL COMMANDS
+    # ------------------------------------------------
 
-def input_thread(bus):
-    while True:
-        line = sys.stdin.readline().strip()
-        if not line:
-            continue
+    def _set_axis_state(self, node, state):
+        self._send(node,
+                   self.CAN_SET_AXIS_STATE,
+                   struct.pack("<I", state))
 
-        parts = line.split(",")
+    def _set_controller_mode(self, node, control, input_mode):
+        self._send(node,
+                   self.CAN_SET_CONTROLLER_MODES,
+                   struct.pack("<II", control, input_mode))
 
-        try:
-            od_idx = int(parts[0]) - 1
-        except:
-            continue
+    # ------------------------------------------------
+    # PUBLIC CONTROL FUNCTIONS
+    # ------------------------------------------------
 
-        if od_idx < 0 or od_idx >= len(NODE_IDS):
-            continue
+    def set_idle(self, node):
+        self._set_axis_state(node, self.AXIS_STATE_IDLE)
 
-        node_id = NODE_IDS[od_idx]
+    def set_velocity(self, node, velocity):
 
-        if parts[1].lower() == "i":
-            set_axis_state(bus, node_id, AXIS_STATE_IDLE)
-            clear_setpoints(node_id)
-            continue
+        self.setpoints[node]["vel"] = velocity
 
-        if parts[1].lower() == "c":
-            try:
-                new_current = float(parts[2])
-            except:
-                continue
+        self._set_controller_mode(node,
+                                  self.CONTROL_MODE_VELOCITY,
+                                  self.INPUT_MODE_PASSTHROUGH)
 
-            vel_limit = current_limits[node_id]["vel_limit"]
-            set_limits(bus, node_id, vel_limit, new_current)
-            continue
+        self._send(node,
+                   self.CAN_SET_INPUT_VEL,
+                   struct.pack("<ff", velocity, 0.0))
 
-        try:
-            value = float(parts[1])
-        except:
-            continue
+    def set_torque(self, node, torque):
 
-        send_command(bus, node_id, value)
+        self.setpoints[node]["iq"] = torque
 
-def main():
-    bus = can.Bus(interface="slcan", channel=COM_PORT, bitrate=BITRATE)
+        self._set_controller_mode(node,
+                                  self.CONTROL_MODE_TORQUE,
+                                  self.INPUT_MODE_PASSTHROUGH)
 
-    for node_id in NODE_IDS:
-        set_axis_state(bus, node_id, AXIS_STATE_IDLE)
-        time.sleep(0.05)
+        self._send(node,
+                   self.CAN_SET_INPUT_TORQUE,
+                   struct.pack("<f", torque))
 
-        set_limits(bus, node_id, DEFAULT_VEL_LIMIT, DEFAULT_CURRENT_SOFT_MAX)
-        time.sleep(0.05)
+    def set_position(self, node, pos):
 
-        set_controller_mode(bus, node_id, CONTROL_MODE_VELOCITY, INPUT_MODE_PASSTHROUGH)
-        time.sleep(0.05)
+        self.setpoints[node]["pos"] = pos
 
-        set_axis_state(bus, node_id, AXIS_STATE_CLOSED_LOOP_CONTROL)
+        self._set_controller_mode(node,
+                                  self.CONTROL_MODE_POSITION,
+                                  self.INPUT_MODE_PASSTHROUGH)
 
-    threading.Thread(target=input_thread, args=(bus,), daemon=True).start()
+        self._send(node,
+                   self.CAN_SET_INPUT_POS,
+                   struct.pack("<fhh", pos, 0, 0))
 
-    timestamp = time.strftime("%Y-%m-%d_%H-%M-%S")
-    csv_filename = os.path.join(CSV_DIR, f"{CSV_PREFIX}{timestamp}.csv")
+    # ------------------------------------------------
+    # LIMITS
+    # ------------------------------------------------
 
-    start_time = time.time()
+    def set_limits(self, node, vel_limit, current_soft_max):
 
-    with open(csv_filename, "w", newline="") as f:
-        writer = csv.writer(f)
+        self._send(node,
+                   self.CAN_SET_LIMITS,
+                   struct.pack("<ff", vel_limit, current_soft_max))
 
-        writer.writerow([
-            "time_s",
-            "od1_setpoint_vel",
-            "od1_pos",
-            "od1_vel",
-            "od1_iq",
-            "od1_bus_v",
-            "od1_bus_i",
-            "od1_axis_err",
-            "od2_setpoint_vel",
-            "od2_pos",
-            "od2_vel",
-            "od2_iq",
-            "od2_bus_v",
-            "od2_bus_i",
-            "od2_axis_err",
-        ])
+    def set_current_soft_max(self, node, amps):
 
-        while True:
+        self.set_limits(node,
+                        self.DEFAULT_VEL_LIMIT,
+                        amps)
 
-            try:
-                msg = bus.recv(timeout=0.01)
-            except ValueError:
-               continue
-            if msg:
-                parse_odrive_message(msg)
+    def set_velocity_limit(self, node, vel):
 
-            t = time.time() - start_time
+        self.set_limits(node,
+                        vel,
+                        self.DEFAULT_CURRENT_SOFT_MAX)
 
-            s1 = state[NODE_IDS[0]]
-            s2 = state[NODE_IDS[1]]
-            sp1 = setpoints[NODE_IDS[0]]
-            sp2 = setpoints[NODE_IDS[1]]
+    # ------------------------------------------------
+    # CAN PARSER
+    # ------------------------------------------------
+
+    def _parse(self, msg):
+
+        node = (msg.arbitration_id >> 5) & 0x3F
+        cmd = msg.arbitration_id & 0x1F
+
+        if node not in self.state:
+            return
+
+        data = msg.data
+        s = self.state[node]
+
+        if cmd == self.CAN_GET_ENCODER_ESTIMATES:
+            s["pos"], = struct.unpack("<f", data[0:4])
+            s["vel"], = struct.unpack("<f", data[4:8])
+
+        elif cmd == self.CAN_GET_IQ:
+            s["iq"], = struct.unpack("<f", data[4:8])
+
+        elif cmd == self.CAN_GET_BUS_VOLTAGE_CURRENT:
+            s["bus_v"], = struct.unpack("<f", data[0:4])
+            s["bus_i"], = struct.unpack("<f", data[4:8])
+
+        elif cmd == self.CAN_GET_ERRORS:
+            s["axis_err"], = struct.unpack("<I", data[4:8])
+
+    # ------------------------------------------------
+    # LOGGING THREAD
+    # ------------------------------------------------
+
+    def _logging_loop(self):
+
+        timestamp = time.strftime("%Y-%m-%d_%H-%M-%S")
+        csv_filename = os.path.join(self.CSV_DIR, f"{self.CSV_PREFIX}{timestamp}.csv")
+
+        start_time = time.time()
+
+        with open(csv_filename, "w", newline="") as f:
+
+            writer = csv.writer(f)
 
             writer.writerow([
-                t,
-                sp1["vel"],
-                s1["pos"], s1["vel"], s1["iq"],
-                s1["bus_v"], s1["bus_i"], s1["axis_err"],
-                sp2["vel"],
-                s2["pos"], s2["vel"], s2["iq"],
-                s2["bus_v"], s2["bus_i"], s2["axis_err"],
+                "time_s",
+                "od1_setpoint_pos",
+                "od1_setpoint_vel",
+                "od1_setpoint_iq",
+                "od1_pos",
+                "od1_vel",
+                "od1_iq",
+                "od1_bus_v",
+                "od1_bus_i",
+                "od1_axis_err",
+                "od2_setpoint_pos",
+                "od2_setpoint_vel",
+                "od2_setpoint_iq",
+                "od2_pos",
+                "od2_vel",
+                "od2_iq",
+                "od2_bus_v",
+                "od2_bus_i",
+                "od2_axis_err",
             ])
 
             f.flush()
 
-if __name__ == "__main__":
-    main()
+            print(f"[Logger] Writing to {csv_filename}")
+
+            while self.running:
+
+                try:
+
+                    msg = self.bus.recv(timeout=0.01)
+
+                    if msg:
+                        self._parse(msg)
+
+                    t = time.time() - start_time
+
+                    s1 = self.state[self.NODE_IDS[0]]
+                    s2 = self.state[self.NODE_IDS[1]]
+
+                    sp1 = self.setpoints[self.NODE_IDS[0]]
+                    sp2 = self.setpoints[self.NODE_IDS[1]]
+
+                    writer.writerow([
+                        t,
+                        sp1["pos"], sp1["vel"], sp1["iq"],
+                        s1["pos"], s1["vel"], s1["iq"],
+                        s1["bus_v"], s1["bus_i"], s1["axis_err"],
+                        sp2["pos"], sp2["vel"], sp2["iq"],
+                        s2["pos"], s2["vel"], s2["iq"],
+                        s2["bus_v"], s2["bus_i"], s2["axis_err"],
+                    ])
+
+                    f.flush()
+
+                except Exception as e:
+                    print("[Logger] error:", e)
+                    time.sleep(0.05)
