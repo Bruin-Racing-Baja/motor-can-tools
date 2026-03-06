@@ -2,3 +2,4 @@ python-can
 numpy
 pandas
 matplotlib
+pyserial
