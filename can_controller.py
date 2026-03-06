@@ -5,6 +5,10 @@ import csv
 import threading
 import os
 
+import math
+
+MOTOR_KV = 140.0
+TORQUE_CONSTANT = 60.0 / (2 * math.pi * MOTOR_KV)
 
 class ODriveCAN:
 
@@ -70,9 +74,6 @@ class ODriveCAN:
             for node in self.NODE_IDS
         }
 
-    # ------------------------------------------------
-    # CAN UTILITIES
-    # ------------------------------------------------
 
     def _arb(self, node, cmd):
         return (node << 5) | cmd
@@ -85,9 +86,7 @@ class ODriveCAN:
         )
         self.bus.send(msg)
 
-    # ------------------------------------------------
-    # INITIALIZATION
-    # ------------------------------------------------
+
 
     def start(self):
 
@@ -118,9 +117,7 @@ class ODriveCAN:
             daemon=True
         ).start()
 
-    # ------------------------------------------------
-    # INTERNAL COMMANDS
-    # ------------------------------------------------
+
 
     def _set_axis_state(self, node, state):
         self._send(node,
@@ -132,36 +129,54 @@ class ODriveCAN:
                    self.CAN_SET_CONTROLLER_MODES,
                    struct.pack("<II", control, input_mode))
 
-    # ------------------------------------------------
-    # PUBLIC CONTROL FUNCTIONS
-    # ------------------------------------------------
-
     def set_idle(self, node):
         self._set_axis_state(node, self.AXIS_STATE_IDLE)
 
     def set_velocity(self, node, velocity):
+    
+        self._set_controller_mode(
+            node,
+            self.CONTROL_MODE_VELOCITY,
+            self.INPUT_MODE_PASSTHROUGH
+        )
+
+        self._set_axis_state(
+            node,
+            self.AXIS_STATE_CLOSED_LOOP_CONTROL
+        )
 
         self.setpoints[node]["vel"] = velocity
 
-        self._set_controller_mode(node,
-                                  self.CONTROL_MODE_VELOCITY,
-                                  self.INPUT_MODE_PASSTHROUGH)
-
-        self._send(node,
-                   self.CAN_SET_INPUT_VEL,
-                   struct.pack("<ff", velocity, 0.0))
+        self._send(
+            node,
+            self.CAN_SET_INPUT_VEL,
+            struct.pack("<ff", velocity, 0.0)
+        )
 
     def set_torque(self, node, torque):
 
+        # Ensure torque controller mode
+        self._set_controller_mode(
+            node,
+            self.CONTROL_MODE_TORQUE,
+            self.INPUT_MODE_PASSTHROUGH
+        )
+
+        # Ensure closed loop control
+        self._set_axis_state(
+            node,
+            self.AXIS_STATE_CLOSED_LOOP_CONTROL
+        )
+
+        # Store setpoint (Nm internally)
         self.setpoints[node]["iq"] = torque
 
-        self._set_controller_mode(node,
-                                  self.CONTROL_MODE_TORQUE,
-                                  self.INPUT_MODE_PASSTHROUGH)
-
-        self._send(node,
-                   self.CAN_SET_INPUT_TORQUE,
-                   struct.pack("<f", torque))
+        # Send torque command
+        self._send(
+            node,
+            self.CAN_SET_INPUT_TORQUE,
+            struct.pack("<f", torque)
+        )
 
     def set_position(self, node, pos):
 
@@ -174,10 +189,6 @@ class ODriveCAN:
         self._send(node,
                    self.CAN_SET_INPUT_POS,
                    struct.pack("<fhh", pos, 0, 0))
-
-    # ------------------------------------------------
-    # LIMITS
-    # ------------------------------------------------
 
     def set_limits(self, node, vel_limit, current_soft_max):
 
@@ -196,10 +207,6 @@ class ODriveCAN:
         self.set_limits(node,
                         vel,
                         self.DEFAULT_CURRENT_SOFT_MAX)
-
-    # ------------------------------------------------
-    # CAN PARSER
-    # ------------------------------------------------
 
     def _parse(self, msg):
 
@@ -225,10 +232,6 @@ class ODriveCAN:
 
         elif cmd == self.CAN_GET_ERRORS:
             s["axis_err"], = struct.unpack("<I", data[4:8])
-
-    # ------------------------------------------------
-    # LOGGING THREAD
-    # ------------------------------------------------
 
     def _logging_loop(self):
 
@@ -285,14 +288,30 @@ class ODriveCAN:
                     sp2 = self.setpoints[self.NODE_IDS[1]]
 
                     writer.writerow([
-                        t,
-                        sp1["pos"], sp1["vel"], sp1["iq"],
-                        s1["pos"], s1["vel"], s1["iq"],
-                        s1["bus_v"], s1["bus_i"], s1["axis_err"],
-                        sp2["pos"], sp2["vel"], sp2["iq"],
-                        s2["pos"], s2["vel"], s2["iq"],
-                        s2["bus_v"], s2["bus_i"], s2["axis_err"],
-                    ])
+                                    t,
+
+                                    sp1["pos"],
+                                    sp1["vel"],
+                                    (sp1["iq"] / TORQUE_CONSTANT) if sp1["iq"] is not None else None,
+
+                                    s1["pos"],
+                                    s1["vel"],
+                                    s1["iq"],
+                                    s1["bus_v"],
+                                    s1["bus_i"],
+                                    s1["axis_err"],
+
+                                    sp2["pos"],
+                                    sp2["vel"],
+                                    (sp2["iq"] / TORQUE_CONSTANT) if sp2["iq"] is not None else None,
+
+                                    s2["pos"],
+                                    s2["vel"],
+                                    s2["iq"],
+                                    s2["bus_v"],
+                                    s2["bus_i"],
+                                    s2["axis_err"],
+                                ])
 
                     f.flush()
 

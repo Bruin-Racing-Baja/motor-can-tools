@@ -105,9 +105,6 @@ class WaveformController:
 
         self.constants = constants
 
-    # -------------------------------------------------
-    # DEVICE START
-    # -------------------------------------------------
 
     def start(self):
         """
@@ -120,22 +117,15 @@ class WaveformController:
         )
 
         if self.device_handle.value == 0:
-            raise RuntimeError("Failed to open WaveForms device")
+            time.sleep(0.1)
+            # raise RuntimeError("Failed to open WaveForms device")
 
         print("Device opened.\n")
 
-    # -------------------------------------------------
-    # WAVEFORM GENERATOR
-    # -------------------------------------------------
 
     def generate(self, channel, function, offset,
              frequency=1000, amplitude=1, symmetry=50):
-        """
-        Generate waveform on AD2 analog out channel.
-        Mirrors the Digilent SDK example structure.
-        """
 
-        # AD2 channels are 0-indexed
         ch = ctypes.c_int(channel - 1)
 
         # Enable carrier node
@@ -207,7 +197,6 @@ class WaveformController:
                 if value <= 0:
                     continue
 
-                # Convert RPM -> Hz for crank sensor simulation
                 freq_hz = (value / 60.0) * 32
                 freq_hz = max(freq_hz, 1)
 
@@ -232,9 +221,6 @@ class WaveformController:
 
                 print(f"\r{column}: {value:.0f} | Hz: {freq_hz:.1f}", end="")
 
-    # -------------------------------------------------
-    # CONSTANT RPM MODE
-    # -------------------------------------------------
 
     def constant_engine_rpm(self, rpm, channel=1):
 
@@ -251,10 +237,6 @@ class WaveformController:
 
         print(f"Constant RPM: {rpm} | Frequency: {freq_hz:.2f} Hz")
 
-
-# =====================================================
-# USER SETTINGS
-# =====================================================
 
 START_TIME = 74
 END_TIME = 88

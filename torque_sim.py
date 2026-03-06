@@ -3,36 +3,38 @@ import math
 import pandas as pd
 
 
+START_TIME = 74
+END_TIME = 88
+
 MOTOR_KV = 140.0
 TORQUE_CONSTANT = 60.0 / (2 * math.pi * MOTOR_KV)
 
 
 class TorqueSimulator:
 
-    def __init__(self, can_controller, wave_controller, csv_reader, node_id=0x01):
+    def __init__(self, can_controller, wave_controller, csv_reader):
 
         self.can = can_controller
         self.wave = wave_controller
         self.csv_reader = csv_reader
-        self.node_id = node_id
 
         print("[TorqueSim] Loading CSV")
 
-        self.df = pd.read_csv(self.csv_reader.csv_file)
-        self.df.columns = self.df.columns.str.strip()
+        df = self.csv_reader.df.copy()
+        df.columns = df.columns.str.strip()
 
-        required = [
-            "cycle_start_us",
-            "engine_rpm",
-            "iq_measured"
-        ]
+        df["cycle_start_s"] = df["cycle_start_us"] / 1_000_000.0
 
-        for col in required:
-            if col not in self.df.columns:
-                raise ValueError(f"CSV missing column: {col}")
+        df = df[
+            (df["cycle_start_s"] >= START_TIME) &
+            (df["cycle_start_s"] <= END_TIME)
+        ].copy()
 
-        print(f"[TorqueSim] Rows loaded: {len(self.df)}")
+        df.reset_index(drop=True, inplace=True)
 
+        self.df = df
+
+        print(f"[TorqueSim] Playback rows: {len(self.df)}")
 
     def start(self):
 
@@ -43,6 +45,7 @@ class TorqueSimulator:
         for _, row in self.df.iterrows():
 
             rpm = row["engine_rpm"]
+            vel_cmd = row["velocity_command"]
             iq = row["iq_measured"]
             current_time = row["cycle_start_us"]
 
@@ -61,11 +64,19 @@ class TorqueSimulator:
                 symmetry=50
             )
 
+
+            if not pd.isna(vel_cmd):
+                self.can.set_velocity(0x01, float(vel_cmd))
+
+
             if not pd.isna(iq):
+
                 torque_nm = iq * TORQUE_CONSTANT
-                self.can.set_torque(self.node_id, float(torque_nm))
+                self.can.set_torque(0x03, float(torque_nm))
+
             else:
                 torque_nm = 0
+
 
             if previous_time is not None:
 
@@ -79,8 +90,19 @@ class TorqueSimulator:
 
             print(
                 f"\rRPM {rpm:.0f} | Hz {freq_hz:.1f} | "
+                f"VelCmd {vel_cmd:.2f} | "
                 f"Iq {iq:.2f}A | Torque {torque_nm:.3f}Nm",
                 end=""
             )
 
         print("\n[TorqueSim] Playback complete")
+
+        # hold rpm signal
+        print("[TorqueSim] Holding RPM at 3000")
+        
+        self.wave.constant_engine_rpm(3000, channel=1)
+
+        # idle motors
+        print("[TorqueSim] Setting motors to IDLE")
+        self.can.set_idle(0x01)
+        self.can.set_idle(0x03)
