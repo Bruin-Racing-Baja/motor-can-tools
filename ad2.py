@@ -5,30 +5,39 @@ from sys import platform, path
 from os import sep
 
 
-# =====================================================
-# CSV READER
-# =====================================================
 
 class CSVReader:
     """
     Handles loading and querying CSV telemetry.
+    Provides terminal telemetry when loading and accessing data.
     """
 
     def __init__(self, filepath):
-        # Load CSV
+
         self.filepath = filepath
+
+        print(f"[CSVReader] Loading CSV: {filepath}")
+
         self.df = pd.read_csv(filepath)
 
-        # Normalize column names
+        # normalize column names
         self.df.columns = self.df.columns.str.strip()
 
-        # Convert timestamp to seconds if present
+        print(f"[CSVReader] Rows loaded: {len(self.df)}")
+        print(f"[CSVReader] Columns detected: {list(self.df.columns)}")
+
+        # convert timestamps if available
         if "cycle_start_us" in self.df.columns:
+
             self.df["cycle_start_s"] = self.df["cycle_start_us"] / 1_000_000.0
+
+            print("[CSVReader] Converted cycle_start_us → cycle_start_s")
+
+        print("[CSVReader] Initialization complete\n")
 
     def get_segment(self, start_time, end_time):
         """
-        Return dataframe slice between start and end time.
+        Return dataframe slice between times.
         """
 
         segment = self.df[
@@ -38,6 +47,11 @@ class CSVReader:
 
         segment.reset_index(drop=True, inplace=True)
 
+        print(
+            f"[CSVReader] Segment selected: "
+            f"{start_time}s → {end_time}s | Rows: {len(segment)}"
+        )
+
         return segment
 
     def get_column(self, column_name):
@@ -46,7 +60,9 @@ class CSVReader:
         """
 
         if column_name not in self.df.columns:
-            raise ValueError(f"Column '{column_name}' not found")
+            raise ValueError(f"[CSVReader] Column '{column_name}' not found")
+
+        print(f"[CSVReader] Accessing column: {column_name}")
 
         return self.df[column_name]
 
@@ -89,9 +105,6 @@ class WaveformController:
 
         self.constants = constants
 
-    # -------------------------------------------------
-    # DEVICE START
-    # -------------------------------------------------
 
     def start(self):
         """
@@ -104,70 +117,63 @@ class WaveformController:
         )
 
         if self.device_handle.value == 0:
-            raise RuntimeError("Failed to open WaveForms device")
+            time.sleep(0.1)
+            # raise RuntimeError("Failed to open WaveForms device")
 
         print("Device opened.\n")
 
-    # -------------------------------------------------
-    # WAVEFORM GENERATOR
-    # -------------------------------------------------
 
     def generate(self, channel, function, offset,
-                 frequency=1000, amplitude=1, symmetry=50):
+             frequency=1000, amplitude=1, symmetry=50):
 
-        channel = ctypes.c_int(channel - 1)
+        ch = ctypes.c_int(channel - 1)
 
+        # Enable carrier node
         self.dwf.FDwfAnalogOutNodeEnableSet(
             self.device_handle,
-            channel,
+            ch,
             self.constants.AnalogOutNodeCarrier,
             ctypes.c_bool(True)
         )
 
+        # Set waveform function
         self.dwf.FDwfAnalogOutNodeFunctionSet(
             self.device_handle,
-            channel,
+            ch,
             self.constants.AnalogOutNodeCarrier,
             function
         )
 
-        self.dwf.FDwfAnalogOutNodeFrequencySet(
-            self.device_handle,
-            channel,
-            self.constants.AnalogOutNodeCarrier,
-            ctypes.c_double(frequency)
-        )
-
+        # Set amplitude
         self.dwf.FDwfAnalogOutNodeAmplitudeSet(
             self.device_handle,
-            channel,
+            ch,
             self.constants.AnalogOutNodeCarrier,
             ctypes.c_double(amplitude)
         )
 
+        # Set offset
         self.dwf.FDwfAnalogOutNodeOffsetSet(
             self.device_handle,
-            channel,
+            ch,
             self.constants.AnalogOutNodeCarrier,
             ctypes.c_double(offset)
         )
 
-        self.dwf.FDwfAnalogOutNodeSymmetrySet(
+        # Set frequency
+        self.dwf.FDwfAnalogOutNodeFrequencySet(
             self.device_handle,
-            channel,
+            ch,
             self.constants.AnalogOutNodeCarrier,
-            ctypes.c_double(symmetry)
+            ctypes.c_double(frequency)
         )
 
+        # Start waveform output
         self.dwf.FDwfAnalogOutConfigure(
             self.device_handle,
-            channel,
+            ch,
             ctypes.c_bool(True)
         )
-
-    # -------------------------------------------------
-    # PLAYBACK FROM CSV COLUMN
-    # -------------------------------------------------
 
     def play_column(self, column, start_time, end_time, channel=1):
         """
@@ -191,7 +197,6 @@ class WaveformController:
                 if value <= 0:
                     continue
 
-                # Convert RPM -> Hz for crank sensor simulation
                 freq_hz = (value / 60.0) * 32
                 freq_hz = max(freq_hz, 1)
 
@@ -216,14 +221,8 @@ class WaveformController:
 
                 print(f"\r{column}: {value:.0f} | Hz: {freq_hz:.1f}", end="")
 
-    # -------------------------------------------------
-    # CONSTANT RPM MODE
-    # -------------------------------------------------
 
     def constant_engine_rpm(self, rpm, channel=1):
-        """
-        Generate constant RPM signal.
-        """
 
         freq_hz = (rpm / 60.0) * 32
 
@@ -239,43 +238,8 @@ class WaveformController:
         print(f"Constant RPM: {rpm} | Frequency: {freq_hz:.2f} Hz")
 
 
-# =====================================================
-# USER SETTINGS
-# =====================================================
-
 START_TIME = 74
 END_TIME = 88
 
 CSV_FILE = "log_2025-06-01_20-50-58.csv"
 
-
-# =====================================================
-# MAIN PROGRAM
-# =====================================================
-
-if __name__ == "__main__":
-
-    # Initialize CSV reader
-    csv_reader = CSVReader(CSV_FILE)
-
-    # Initialize waveform controller
-    wave = WaveformController(csv_reader)
-
-    # Start Digilent device
-    wave.start()
-
-    # ---------------------------------
-    # OPTION 1: Playback CSV engine RPM
-    # ---------------------------------
-
-    wave.play_column(
-        column="engine_rpm",
-        start_time=START_TIME,
-        end_time=END_TIME,
-        channel=1
-    )
-
-    # ---------------------------------
-    # OPTION 2: Constant RPM
-    # ---------------------------------
-    # wave.constant_engine_rpm(3500)
